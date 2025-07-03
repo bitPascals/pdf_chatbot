@@ -1,9 +1,7 @@
-name: Sync to Hugging Face hub
+name: Sync to Hugging Face Hub
 on:
   push:
     branches: [main]
-
-  # to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
@@ -14,7 +12,16 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
-      - name: Push to hub
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name "Your Name"
+          git config --global user.email "your@email.com"
+          git remote set-url origin https://bitpascals:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/bitpascals/rag_chatbot
+      
+      - name: Push to Hugging Face Hub
         env:
-          HF_TOKEN: ${{ secrets.bitpascals }}
-        run: git push https://bitpascals:$HF_TOKEN@huggingface.co/spaces/bitpascals/rag_chatbot main
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git pull origin main  # Ensure we're up to date
+          git push origin main
