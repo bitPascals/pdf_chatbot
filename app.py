@@ -1,5 +1,6 @@
 import os
 import torch
+import logging
 from werkzeug.utils import secure_filename
 from langchain_groq import ChatGroq
 from flask import Flask, request, jsonify, render_template
@@ -11,14 +12,17 @@ from langchain_chroma import Chroma
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import MessagesPlaceholder
 from langchain.chains import create_history_aware_retriever
 from langchain_core.documents import Document
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-## Configuration
+# Configuration
 load_dotenv()
 UPLOAD_FOLDER = 'pdfs'
 ALLOWED_EXTENSIONS = {'pdf'}
@@ -57,16 +61,19 @@ def process_and_add_pdfs(filenames, embeddings, vectorstore):
                 doc.metadata['source'] = filename
             new_docs.extend(split_docs)
         except Exception as e:
-            print(f"Error processing {filename}: {str(e)}")
+            logger.error(f"Error processing {filename}: {str(e)}")
     if new_docs:
         vectorstore.add_documents(new_docs)
-        # vectorstore.persist()  # Not needed with langchain_chroma
     return len(new_docs)
 
 def initialize_rag(vectorstore):
     groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY not found in environment variables")
+    
     llm = ChatGroq(api_key=groq_api_key, model_name="Llama3-8b-8192")
 
+    # System prompt for answering questions
     system_prompt = """
 You are a helpful assistant. Use the provided context from PDF documents to answer the user's question as accurately and helpfully as possible.
 - If the answer is directly available, provide it.
@@ -81,43 +88,42 @@ Context:
 {context}
 """
 
-    prompt = ChatPromptTemplate.from_messages([
+    # Prompt for answering questions
+    qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", "{input}")
     ])
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3}, search_type="similarity")
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    # Prompt for contextualizing questions based on history
+    contextualize_q_system_prompt = """Given a chat history and the latest user question \
+    which might reference context in the chat history, formulate a standalone question \
+    which can be understood without the chat history. Do NOT answer the question, \
+    just reformulate it if needed and otherwise return it as is."""
 
-    contexualize_q_system_prompt = """
-    Reformulate the user's question to be standalone based on chat history,
-    but ONLY if the referenced information exists in the PDF documents.
-    Never reference information outside the PDF context.
-    If the question references something not in the documents, ask for clarification.
-    """
-
-
-    chat_prompt = ChatPromptTemplate.from_messages([
-        ("system", contexualize_q_system_prompt),
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", contextualize_q_system_prompt),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}")
     ])
 
+    # Create components
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3}, search_type="similarity")
     history_aware_retriever = create_history_aware_retriever(
         llm=llm,
         retriever=retriever,
-        prompt=chat_prompt
+        prompt=contextualize_q_prompt
     )
-
-    final_rag_chain = create_retrieval_chain(
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    
+    # Combine into final chain
+    rag_chain = create_retrieval_chain(
         history_aware_retriever,
-        create_stuff_documents_chain(llm=llm, prompt=prompt)
+        question_answer_chain
     )
 
-    return final_rag_chain
+    return rag_chain
 
-# Global variables
+# Initialize global components
 embeddings = get_embeddings()
 vectorstore = get_vectorstore(embeddings)
 rag_chain = initialize_rag(vectorstore)
@@ -143,13 +149,11 @@ def upload_file():
                 file.save(filepath)
                 uploaded_files.append(filename)
             else:
-                # If file already exists, skip re-upload
                 uploaded_files.append(filename)
 
     if not uploaded_files:
         return jsonify({'error': 'No valid PDF files uploaded'}), 400
 
-    # Only process and add new PDFs
     processed_count = process_and_add_pdfs(uploaded_files, embeddings, vectorstore)
     global rag_chain
     rag_chain = initialize_rag(vectorstore)
@@ -173,16 +177,24 @@ def ask_question():
         return jsonify({'error': 'No question provided'}), 400
 
     try:
+        # Invoke the RAG chain
         response = rag_chain.invoke({
             "input": user_input,
             "chat_history": chat_history
         })
 
+        # Ensure we got a valid response
+        if "answer" not in response:
+            logger.error(f"Unexpected response format: {response}")
+            return jsonify({'error': 'Unexpected response from AI service'}), 500
+
+        # Update chat history with consistent message format
         chat_history.extend([
-            HumanMessage(content=user_input),
-            AIMessage(content=response["answer"])
+            {"role": "user", "content": user_input},
+            {"role": "assistant", "content": response["answer"]}
         ])
 
+        # Limit chat history length
         if len(chat_history) > 10:
             chat_history = chat_history[-10:]
 
@@ -191,6 +203,7 @@ def ask_question():
             'answer': response["answer"]
         })
     except Exception as e:
+        logger.error(f"Error processing question: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/reset', methods=['POST'])
@@ -205,6 +218,7 @@ def list_documents():
         files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.pdf')]
         return jsonify({'documents': files})
     except Exception as e:
+        logger.error(f"Error listing documents: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
